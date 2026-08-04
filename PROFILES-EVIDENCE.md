@@ -422,6 +422,54 @@ Reuse short-circuits the launch entirely — `internal/session/setup.go` sets
 `if !skipLaunch` (line 379). `skipLaunch` bypasses the code that consumes
 `[container] image`.
 
+### G4a. The exact Incus key surface COI writes
+
+Extracted with
+`grep -rhoE '"(limits|security|raw|environment|boot|cloud-init|user|linux|migration|snapshots|nvidia)\.[a-zA-Z0-9._]+' internal/ --include=*.go | sort -u`,
+then filtered to genuine Incus keys (see §G4b for the false friends the raw grep also
+catches).
+
+**Instance-level (`incus config set`):**
+
+```
+limits.cpu                                limits.memory
+limits.cpu.allowance                      limits.memory.enforce
+limits.cpu.priority                       limits.memory.swap
+limits.disk.priority                      limits.processes
+raw.idmap                                 security.guestapi
+security.nesting                          security.idmap.isolated
+security.syscalls.intercept.mknod         security.syscalls.intercept.setxattr
+linux.sysctl.net.ipv4.ip_unprivileged_port_start
+linux.sysctl.net.ipv6.conf.all.disable_ipv6
+linux.sysctl.net.ipv6.conf.default.disable_ipv6
+user.coi.alias
+```
+
+**Device-level (`incus config device set`):**
+
+```
+root disk : limits.read, limits.write, limits.max      (internal/limits/applier.go:124-136)
+nic       : security.ipv4_filtering, security.mac_filtering, security.port_isolation
+                                                        (internal/container/commands.go:596-616)
+```
+
+**Read-only — never written:** `security.privileged`, `raw.apparmor`, `raw.seccomp`.
+These appear only in the privileged guard and the health posture checks (§G2), which
+inspect Incus's `default` profile.
+
+Notably absent: `environment.*`. Incus profiles have first-class per-instance environment
+keys; COI's `[environment]` never uses them and injects at exec time instead.
+
+### G4b. False friends in the grep output
+
+The same grep also matches COI's own TOML key names, which are not Incus keys:
+
+| Looks like an Incus key | Actually |
+|---|---|
+| `security.protected_paths`, `security.writable_paths`, `security.host_immutable`, `security.disable_protection`, `security.secret_paths` | COI config keys — implemented as read-only bind mounts and host `chattr +i` |
+| `limits.runtime.max_duration`, `limits.runtime.auto_stop` | a host-side Go monitor (`internal/limits/`), no Incus key |
+| `user.name`, `user.email`, `user.useConfigOnly` | `git config` keys, not Incus `user.*` metadata |
+
 ### G5. Profile name *is* persisted per session and per alias
 
 ```go
@@ -438,6 +486,74 @@ if !cmd.Flags().Changed("profile") && metadata.ProfileName != "" {
 	fmt.Fprintf(os.Stderr, "Inherited profile '%s' from session\n", a.profile)
 }
 ```
+
+### G6. …but nothing on the Incus side records it
+
+`grep -rn "user.coi" internal/ --include=*.go` (excluding tests) returns **only**
+`user.coi.alias` — set in `internal/session/setup.go:584` and
+`internal/cli/run.go:437`, read back in `internal/alias/resolve.go:157` and
+`internal/cli/list.go:191`. There is no `user.coi.profile`.
+
+So the container carries no Incus-visible trace of which COI profile shaped it; the only
+record is `metadata.json` under the sessions dir on the host. Editing a COI profile
+therefore cannot re-shape existing containers, which is the opposite of an Incus profile's
+live-reference semantics.
+
+### G7. Creation-only vs. re-established every session
+
+`skipLaunch` (set on the reuse paths, §G4) guards the block beginning at
+`internal/session/setup.go:379`, which is where limits are applied:
+
+```go
+// internal/session/setup.go:379,498
+if !skipLaunch {
+	...
+	if err := limits.ApplyResourceLimits(applyOpts); err != nil { ... }
+```
+
+Other settings are deliberately re-applied on reuse. From the trust chokepoint
+(`internal/session/setup.go` ~318-330):
+
+```go
+// This deliberately runs on the REUSE paths too: sockets, credentials
+// (resume), and ports are re-applied from the current config every
+// session, so gating only at creation would let an untrusted repo config
+// smuggle them onto a reused container. Mount devices are the exception —
+// they persist from creation and can't be re-gated here, so on reuse we
+// warn instead.
+```
+
+and the reuse warning it emits:
+
+```
+Warning: N untrusted mount(s) remain attached from when this container was created;
+recreate it (coi kill + relaunch) to apply mount-trust changes
+```
+
+Protected paths and secret masks are also reconciled on reuse — `StripSecurityDevices`
+plus a re-run of the shared `applySessionSecurity`
+(`internal/session/security.go:84-138`):
+
+```go
+// This is the reuse-path analogue of RemoveStalePortDevices and the heart of the
+// issue #610 fix: on a fresh launch SetupSecurityMounts / SetupSecretMasks /
+// SetupCommonDirProtection materialize each source and attach the device, but on
+// reuse those functions never ran, so a device attached at first launch keeps its
+// original host source forever. ... Stripping here + re-running the SAME validated
+// setup means ... protection is re-established to match the CURRENT workspace
+// (paths added, removed, or replaced since first launch).
+```
+
+Network rules are re-applied too: `network.ApplyBootBlockRule` runs on the restart path
+(`internal/session/setup.go:293`) before `SetupForContainer` installs the full ruleset.
+
+| Baked in at creation | Re-established every session |
+|---|---|
+| image, storage pool, `[limits.*]`, `[[mounts]]`, `security.*` hardening keys, `raw.idmap` | `[[sockets]]`, `[ports]`, `[[credentials]]`, network egress rules, `[security] protected_paths` + `secret_paths` |
+
+Roughly — though not exactly — the creation-only column is the state COI writes into Incus
+instance config, and the per-session column is COI's own host-side and device work.
+`[[mounts]]` is the clean counter-example: an Incus disk device, but creation-only.
 
 ---
 

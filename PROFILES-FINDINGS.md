@@ -16,8 +16,10 @@ A COI profile is a **named, versionable bundle of session policy** — a directo
 `config.toml` (plus optional build script and agent context file) that overrides the
 resolved configuration for one invocation, selected with `--profile <name>`.
 
-It has **nothing to do with an Incus profile**, despite the shared word. Different layer,
-different mechanism, no interaction (§G).
+It is **not an Incus profile**, despite the shared word. The two overlap substantially in
+*what they can express* — CPU/memory/disk limits, bind mounts, proxy devices, hardening
+keys — and share no mechanism whatsoever: COI writes all of it straight to the instance
+and never creates, names or attaches an Incus profile object (§3.2, §G).
 
 ---
 
@@ -118,11 +120,92 @@ Incus's `default` profile (§G2): the privileged-container guard, two `coi healt
 checks, bridge-name discovery for nft rules, and one *install-time* write in `install.sh`
 that points the default profile's root device at the ZFS pool.
 
-So the word "profile" is overloaded across the two systems, and the overlap is purely
-lexical. When a COI doc says "the default profile has `security.privileged=true`", that's
-the *Incus* one; when it says "`--profile hardened`", that's the *COI* one.
+So the word "profile" is overloaded across the two systems. When a COI doc says "the
+default profile has `security.privileged=true`", that's the *Incus* one; when it says
+"`--profile hardened`", that's the *COI* one.
 
-### 3.2 What a COI profile actually becomes
+### 3.2 They do overlap — on vocabulary, not plumbing
+
+The two genuinely share a lot of expressible policy. What they don't share is any
+mechanism: every key in the middle column below is one COI writes **directly to the
+instance**, never through an Incus profile object.
+
+| Only an Incus profile | Both can express it | Only a COI profile |
+|---|---|---|
+| `gpu`, `usb`, `tpm`, `pci`, `infiniband`, `unix-char`/`unix-block` devices | **CPU limits** — `limits.cpu`, `.allowance`, `.priority` | **Which image to launch** (`[container] image`) — an Incus profile cannot carry an image at all |
+| The root `disk` device definition itself (`pool`, `size`) | **Memory limits** — `limits.memory`, `.enforce`, `.swap` | **Network egress policy** — `restricted`/`allowlist`, allowed domains, private-net + metadata blocks (host nft/iptables) |
+| `boot.autostart`, `boot.host_shutdown_timeout` | **Disk I/O limits** — root device `limits.read`/`write`/`max`, `limits.disk.priority` | `[[network.hosts]]` — static name→IP in the container's `/etc/hosts` |
+| `cloud-init.*` (user-data, vendor-data, network-config) | **Process cap** — `limits.processes` | **Secret masking** (`secret_paths`), **protected paths**, host `chattr +i` immutability |
+| `snapshots.schedule`, `.expiry`, `.pattern` | **Bind mounts** — `disk` devices | **Threat monitoring** — auto-pause/kill, nft monitoring |
+| `migration.stateful`, `nvidia.*`, `raw.lxc`, `limits.kernel.*`, `limits.hugepages.*` | **Socket forwarding & port publishing** — `proxy` devices | **Tool selection** — `[tool] name`, `permission_mode`, `[tool.claude] model`/`effort_level` |
+| `environment.*` (Incus's own env-injection keys) | **Container hardening** — `security.nesting`, `.idmap.isolated`, `.guestapi`, `.syscalls.intercept.*` | **Agent context injection** (`context = "CONTEXT.md"`) |
+| `security.protection.delete` / `.shift` | **sysctls** — `linux.sysctl.*` | **Image build recipe** (`[container.build]`) |
+| Arbitrary `user.*` metadata (COI writes only `user.coi.alias`) | **Storage pool** — Incus via the root device, COI via `incus init -s` | **Credentials**, **ephemerality**, **runtime limits** (`max_duration`, `auto_stop`), **timezone**, **git identity/hooks**, **shell/tmux**, **inheritance**, **the trust model**, **session/alias memory** |
+| VM-specific keys (COI is containers-only) | **Environment variables** — same goal, disjoint mechanism (below) | |
+| **Composition**: an instance takes an *ordered list* of profiles, later wins | | **Composition**: exactly one COI profile applies, flattened at load |
+
+**Environment variables are the instructive near-miss.** Incus profiles have first-class
+`environment.FOO=bar` keys. COI's `[environment]` never uses them — it injects at exec
+time. Same capability, entirely disjoint mechanism.
+
+**False friends.** Several COI TOML keys borrow Incus-looking names and are not Incus keys
+at all: `[security] protected_paths` / `writable_paths` / `host_immutable` /
+`disable_protection` / `secret_paths` are COI concepts (read-only bind mounts + host
+`chattr +i`), and `[limits.runtime] max_duration` / `auto_stop` are a host-side Go monitor.
+Conversely `security.privileged`, `raw.apparmor` and `raw.seccomp` *are* real Incus keys,
+but COI only ever **reads** them — on Incus's `default` profile — to refuse a launch or
+fail a health check (§G2).
+
+### 3.3 "Both produce an Incus container" — a frame that half-holds
+
+It is tempting to unify them as *two kinds of input to producing a container*. That is a
+fair first approximation for the middle column above, and it breaks in three places worth
+knowing.
+
+**Neither actually creates one.** An Incus profile cannot, even in principle — profiles
+carry config and devices, never an image; `incus launch <image> <name> -p <profile>`
+creates the instance and the profile only shapes it. A COI profile is closer, since it
+does carry `[container] image`, but it still needs a workspace and slot to produce a name.
+Both are shapers; the Incus one is strictly less sufficient.
+
+**The binding has opposite lifetimes.** An Incus profile stays *attached*: it is a live
+reference in the instance's config, profile-derived values show as inherited, and editing
+the profile re-shapes every instance that references it. A COI profile is *consumed* —
+flattened at load, applied as imperative calls, and then nothing on the Incus side
+remembers it. The only COI metadata written to the instance is `user.coi.alias`; there is
+no `user.coi.profile` (§G6). The record lives in a host-side session JSON. Edit a COI
+profile and existing containers do not change.
+
+And it is not uniformly consumed-once. The split (§G7):
+
+| Baked in at creation | Re-established every session |
+|---|---|
+| image, storage pool, `[limits.*]`, `[[mounts]]`, the `security.*` hardening keys, `raw.idmap` | `[[sockets]]`, `[ports]`, `[[credentials]]`, network egress rules, `[security] protected_paths` and `secret_paths` |
+
+Both halves are deliberate. Sockets, ports and credentials are re-applied every launch
+specifically so an untrusted repo config cannot smuggle them onto a *reused* container
+(gating only at creation would leave that hole). Protected paths and secret masks are
+stripped and re-added on reuse as of #610, so protection always matches the *current*
+workspace rather than the one that existed at first launch. `[[mounts]]` is the
+acknowledged exception — creation-only, with a warning telling you to kill and relaunch.
+
+**A COI profile's effect is not confined to the container.** Host firewall rules on the
+bridge, `chattr +i` on host workspace files, a host monitor process, host `[paths]`
+directories — none of that is instance state, and Incus has no vocabulary for it. And
+`coi build --profile X` produces an *image*, not a container.
+
+So the frame that holds:
+
+> An **Incus profile** is a live, named, server-side fragment of instance state that an
+> instance references.
+> A **COI profile** is a recipe for one session — part baked into an instance at creation,
+> part re-applied on every launch, and part executed on the host entirely outside the
+> container.
+
+They overlap on *what a container should look like*, and diverge on *who remembers it, for
+how long, and how much of it is even inside the container*.
+
+### 3.4 What a COI profile actually becomes
 
 Per-instance Incus state, applied imperatively at launch (§G3):
 
@@ -142,7 +225,7 @@ The baseline container hardening (`security.nesting`, syscall intercepts,
 `security.guestapi=false`, `security.idmap.isolated`) is applied to every instance
 regardless of profile — a profile can't opt out of it.
 
-### 3.3 Profile is not part of container identity — a real consequence
+### 3.5 Profile is not part of container identity — a real consequence
 
 Container names are `prefix + workspaceHash + slot`; the profile name is nowhere in them
 (§G4). For a **persistent** container, reuse is decided by that name alone and sets
@@ -272,7 +355,7 @@ all check out against the code (§I3). What remains:
    image/persistent/build moves but none for inline profile tables. Anyone with an old
    config gets a profile that quietly doesn't exist rather than a migration error.
 
-4. **Persistent-container reuse ignores a changed profile image** (§3.3 above).
+4. **Persistent-container reuse ignores a changed profile image** (§3.5 above).
 
 ---
 
